@@ -1,0 +1,43 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <random>
+#include <numeric>
+#include <algorithm>
+#include <cmath>
+const int  DNA_LENGTH   = 10000;
+const int  NUM_READS    = 5000;
+const int  READ_LENGTH  = 50;
+const int  MAX_MISMATCH = 2;
+const int  SEED         = 42;
+const char BASES[]      = {'A', 'T', 'G', 'C'};
+std::string generateOriginalSequence(std::mt19937& rng) {
+    std::uniform_int_distribution<int> dist(0, 3);
+    std::string seq(DNA_LENGTH, ' ');
+    for (char& c : seq)
+        c = BASES[dist(rng)];
+    return seq;
+}// 0~MAX_MISMATCH개 위치를 랜덤하게 골라 다른 염기로 치환
+std::string introduceMismatches(const std::string& read, std::mt
+19937& rng) {
+    std::uniform_int_distribution<int> numDist(0, MAX_MISMATCH);
+    int n = numDist(rng);
+    if (n == 0) return read;
+    std::string result = read;
+    // 위치 섞어서 앞 n개 선택
+    std::vector<int> idx(READ_LENGTH);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::shuffle(idx.begin(), idx.end(), rng);
+    std::uniform_int_distribution<int> altDist(0, 2); // 나머지
+3개 염기 중 선택
+    for (int i = 0; i < n; i++) {
+        int pos  = idx[i];
+        int orig = (int)(std::find(BASES, BASES + 4, result[pos]
+) - BASES);
+        int alt  = altDist(rng);
+        if (alt >= orig) alt++; // 원래 염기 제외
+        result[pos] = BASES[alt];
+    }
+    return result;
+}
