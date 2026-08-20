@@ -1,0 +1,211 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+
+using namespace std;
+
+// 평가/표시용 상수 (정답 게놈 길이에 맞춰 둘 것)
+constexpr int    N = 10000;
+constexpr int    M = 5000;
+constexpr int    L = 50;
+constexpr int    NUM_SNPS = 80;
+constexpr double SEQ_ERROR_RATE = 0.01;
+
+/* ──────────────────────────────────────────────────────────────
+ *  OVERLAP(A,B): A의 접미사와 B의 접두사가 겹치는 최대 길이.
+ *  원본은 k마다 compare 호출 → 한 쌍당 O(L^2).
+ *  여기서는 prefix-function(KMP)으로 O(lenA+lenB).
+ *    s = B[0:maxK] + SEP + A[lenA-maxK:lenA]
+ *    s의 prefix-function 마지막 값 = 겹치는 최대 길이
+ *  (SEP는 ACGT에 없는 문자라 결과가 자동으로 maxK 이하)
+ *  결과 값 자체는 원본과 100% 동일.
+ * ────────────────────────────────────────────────────────────── */
+static const char SEP = '\x01';
+static vector<char> g_s;     // 재사용 버퍼 (매 호출 할당 방지)
+static vector<int>  g_pi;
+
+static int overlap_len(const string& A, const string& B) {
+    int lenA = (int)A.size(), lenB = (int)B.size();
+    int maxK = lenA < lenB ? lenA : lenB;
+    if (maxK == 0) return 0;
+
+    int len = 2 * maxK + 1;
+    if ((int)g_s.size() < len) { g_s.resize(len);  g_pi.resize(len); }
+
+    // s = B[0:maxK] + SEP + A의 마지막 maxK 글자
+    for (int i = 0; i < maxK; i++) g_s[i] = B[i];
+    g_s[maxK] = SEP;
+    for (int i = 0; i < maxK; i++) g_s[maxK + 1 + i] = A[lenA - maxK + i];
+
+    g_pi[0] = 0;
+    for (int i = 1; i < len; i++) {
+        int k = g_pi[i - 1];
+        while (k > 0 && g_s[i] != g_s[k]) k = g_pi[k - 1];
+        if (g_s[i] == g_s[k]) k++;
+        g_pi[i] = k;
+    }
+    return g_pi[len - 1];
+}
+
+/* ── 증분 greedy 상태 ── */
+static vector<int> bp;   // best partner (i를 접미사쪽 A로 본 최적 j)
+static vector<int> bs;   // 그때의 overlap 점수
+
+/* i 기준 최적 outgoing 파트너 재계산 (동점이면 작은 j 유지 = 원본 tie-break) */
+static void recompute_best(const vector<string>& frags, int i) {
+    int best = -1, bj = -1, total = (int)frags.size();
+    const string& A = frags[i];
+    for (int j = 0; j < total; j++) {
+        if (j == i || frags[j].empty()) continue;
+        int s = overlap_len(A, frags[j]);
+        if (s > best) { best = s; bj = j; }
+    }
+    bs[i] = best; bp[i] = bj;
+}
+
+/* ──────────────────────────────────────────────────────────────
+ *  GREEDY ASSEMBLY (증분식)
+ *  전략·tie-break·종료조건·결과선택 모두 원본과 동일.
+ *
+ *  핵심: 합병은 frags[src] 자리에 그대로 이어붙이고 src의 prefix는
+ *  바뀌지 않으므로, "src를 타깃으로 하는 overlap"은 전부 불변.
+ *  따라서 합병 후 갱신은
+ *    (1) src의 outgoing best 재계산 (접미사가 바뀜)
+ *    (2) 사라진 dst를 best로 갖던 노드 → 선택 시점에 lazy 재계산
+ *  뿐. → 매 합병이 O(active), 전체 ~O(M^2·L).
+ * ────────────────────────────────────────────────────────────── */
+string greedy_assembly(vector<string>& frags) {
+    int total = (int)frags.size();
+    int active_count = 0;
+    for (auto& f : frags) if (!f.empty()) active_count++;
+
+    bp.assign(total, -1);
+    bs.assign(total, -1);
+    for (int i = 0; i < total; i++)
+        if (!frags[i].empty()) recompute_best(frags, i);
+
+    while (active_count > 1) {
+        // 1) 전역 최댓값 선택 (동점 → 작은 i). 죽은 파트너면 lazy 재계산
+        int src = -1;
+        for (;;) {
+            src = -1;
+            for (int i = 0; i < total; i++) {
+                if (frags[i].empty()) continue;
+                if (src < 0 || bs[i] > bs[src]) src = i;
+            }
+            if (src < 0) break;
+            if (bp[src] < 0 || frags[bp[src]].empty()) { recompute_best(frags, src); continue; }
+            break;
+        }
+        if (src < 0 || bs[src] <= 0) {   // 원본의 best_score<=0 종료와 동일
+            cout << "\n종료\n";
+            break;
+        }
+
+        int dst = bp[src];
+        int score = bs[src];
+
+        // 2) 병합: src 자리에 이어붙이고 dst 제거 (원본과 동일)
+        frags[src] += frags[dst].substr(score);
+        frags[dst].clear();
+        active_count--;
+
+        // 3) src의 접미사가 바뀜 → outgoing best 재계산
+        recompute_best(frags, src);
+        // dst를 best로 갖던 노드는 선택 시점에 lazy 보정됨
+
+        if ((total - active_count) % 100 == 0 || active_count == 1) {
+            cout << "\r[Assembly 진행률] 남은 조각: " << active_count
+                << " / 현재 Overlap 수치: " << score << "    " << flush;
+        }
+    }
+    cout << "\n";
+
+    // 결과: 가장 긴 조각 (원본과 동일)
+    string final_result = "";
+    for (const auto& f : frags)
+        if (!f.empty() && f.length() > final_result.length()) final_result = f;
+    return final_result;
+}
+
+int main() {
+    // 1. data/reads.txt
+    cout << "=== [1/3] data/reads.txt 파일 읽는 중 ===\n";
+    ifstream reads_file("data/reads.txt");
+    if (!reads_file.is_open()) {
+        cerr << "에러: data/reads.txt 파일을 찾을 수 없습니다. 파일 위치를 확인해 주세요.\n";
+        return 1;
+    }
+    int loaded_M = 0;
+    reads_file >> loaded_M;
+    vector<string> reads(loaded_M);
+    for (int i = 0; i < loaded_M; i++) {
+        if (!(reads_file >> reads[i])) {
+            cerr << "에러: 파일에서 리드를 읽어오는 데 실패했습니다.\n";
+            return 1;
+        }
+    }
+    reads_file.close();
+    cout << "▶ 완료: 외부 파일에서 총 " << loaded_M << "개의 리드를 로드했습니다.\n\n";
+
+    // 2. reference / answer 로 SNP 계산
+    int snps = 0;
+    ifstream ref_file("data/reference.txt");
+    ifstream ans_file("data/answer.txt");
+    if (ref_file.is_open() && ans_file.is_open()) {
+        string r_seq, a_seq;
+        ref_file >> r_seq; ans_file >> a_seq;
+        ref_file.close(); ans_file.close();
+        int check_len = min(r_seq.length(), a_seq.length());
+        for (int i = 0; i < check_len; i++) if (r_seq[i] != a_seq[i]) snps++;
+    }
+
+    cout << "=== Data Information (Loaded from Files) ===\n"
+        << "Reference:  " << N << " bp\n"
+        << "SNPs:       " << snps << "\n"
+        << "Reads:      " << loaded_M << " x " << L << " bp\n"
+        << "Coverage:   " << (double)loaded_M * L / N << "x\n"
+        << "Error rate: " << SEQ_ERROR_RATE * 100 << " %\n"
+        << "Input:      data/{reference,reads,answer}.txt\n\n";
+
+    // 3. Greedy Assembly
+    cout << "=== [2/3] 외부 리드 기반 Greedy Assembly 시작 ===\n";
+    auto t0 = chrono::high_resolution_clock::now();
+
+    vector<string> frags = reads;
+    string assembled = greedy_assembly(frags);
+
+    auto t1 = chrono::high_resolution_clock::now();
+    double elapsed = chrono::duration<double>(t1 - t0).count();
+
+    ofstream("data/assembly.txt") << assembled << "\n";
+
+    // 4. answer.txt 와 비교 평가
+    cout << "\n=== [3/3] data/answer.txt와 비교 평가 ===\n";
+    ifstream answer_file("data/answer.txt");
+    if (!answer_file.is_open()) {
+        cout << "경고: 정답 파일(data/answer.txt)이 없어 검증을 건너뜁니다.\n";
+        return 0;
+    }
+    string sample; answer_file >> sample; answer_file.close();
+
+    if (assembled.empty()) {
+        cout << "Assembly 실패: 조립된 결과가 없습니다.\n";
+    }
+    else {
+        int asm_len = (int)assembled.length();
+        int cmp_len = min(asm_len, N);
+        int match = 0;
+        for (int i = 0; i < cmp_len; i++) if (assembled[i] == sample[i]) match++;
+        cout << "Assembly length : " << asm_len << " bp\n"
+            << "Accuracy        : " << match << " / " << cmp_len
+            << " (" << fixed << setprecision(2) << (100.0 * match / cmp_len) << " %)\n"
+            << "Time            : " << elapsed << " s\n"
+            << "Output          : data/assembly.txt\n";
+    }
+    return 0;
+}
