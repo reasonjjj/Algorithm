@@ -1,0 +1,265 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
+/*
+ *  시뮬레이션 시나리오
+ *  ──────────────────
+ *  1) Reference genome R (길이 N) 랜덤 생성
+ *  2) R에 NUM_SNPS개 SNP를 도입 → S
+ *  3) S의 랜덤 위치에서 L짜리 read를 M개 추출
+ *     → 각 염기에 SEQ_ERROR_RATE 확률로 오류 삽입
+ *
+ *  N=1000, 8 SNPs → SNP 밀도 0.8%
+ *  L=50  → read 당 평균 SNP ≈ 0.4개
+ *  SEQ_ERROR_RATE 1% → read 당 평균 error ≈ 0.5개
+ *  Coverage = 100 × 50 / 1000 = 5×
+ *
+ *  ※ Greedy assembly는 O(M^2 × L)이므로 M을 100으로 설정
+ */
+
+#define N              1000
+#define M              100
+#define L              50
+#define NUM_SNPS       8
+#define SEQ_ERROR_RATE 0.01
+
+static const char BASE[] = "ACGT";
+
+/* ── 간단한 xorshift32 RNG (재현 가능) ── */
+static unsigned int rng_state = 42;
+
+static unsigned int rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+static double rng_double(void) {
+    return (double)(rng_next() & 0x7FFFFFFF) / (double)0x7FFFFFFF;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  OVERLAP(A, B)
+ *  A의 끝부분과 B의 앞부분이 겹치는 최대 길이를 반환
+ *
+ *  best = 0
+ *  FOR k = 1 TO min(len(A), len(B)):
+ *    IF A의 마지막 k글자 == B의 첫 k글자: best = k
+ *  RETURN best
+ * ═════════════════════════════════════════════════════════════ */
+static int overlap_len(const char* A, int lenA, const char* B, int lenB) {
+    int best = 0;
+    int maxK = lenA < lenB ? lenA : lenB;
+    for (int k = 1; k <= maxK; k++) {
+        if (memcmp(A + lenA - k, B, k) == 0)
+            best = k;
+    }
+    return best;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  GREEDY_ASSEMBLY(reads[])
+ *  가장 많이 겹치는 두 fragment를 반복 합병 → 최종 시퀀스 반환
+ *
+ *  WHILE len(fragments) > 1:
+ *    모든 (i,j) 쌍에서 best overlap 탐색
+ *    merged = A + B[best_score:]
+ *    두 fragment 제거, merged 추가
+ *  RETURN fragments[0][0:N]
+ * ═════════════════════════════════════════════════════════════ */
+static char* greedy_assembly(char** frags, int* frag_lens, int count) {
+    while (count > 1) {
+        int best_score = -1, best_i = 0, best_j = 0;
+
+        /* 모든 (i, j) 쌍 비교 */
+        for (int i = 0; i < count; i++) {
+            for (int j = 0; j < count; j++) {
+                if (i == j) continue;  /* 자신 제외 */
+                int score = overlap_len(frags[i], frag_lens[i],
+                    frags[j], frag_lens[j]);
+                if (score > best_score) {
+                    best_score = score;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        /* merged = A + B[best_score:] */
+        int new_len = frag_lens[best_i] + frag_lens[best_j] - best_score;
+        char* merged = (char*)malloc(new_len + 1);
+        if (!merged) { fprintf(stderr, "malloc failed\n"); exit(1); }
+
+        memcpy(merged, frags[best_i], frag_lens[best_i]);
+        memcpy(merged + frag_lens[best_i],
+            frags[best_j] + best_score,
+            frag_lens[best_j] - best_score);
+        merged[new_len] = '\0';
+
+        /* 기존 두 fragment 해제 */
+        free(frags[best_i]);
+        free(frags[best_j]);
+
+        /* 높은 인덱스부터 제거해야 인덱스가 꼬이지 않음 */
+        int hi = best_i > best_j ? best_i : best_j;
+        int lo = best_i < best_j ? best_i : best_j;
+
+        for (int k = hi; k < count - 1; k++) {
+            frags[k] = frags[k + 1];
+            frag_lens[k] = frag_lens[k + 1];
+        }
+        count--;
+        for (int k = lo; k < count - 1; k++) {
+            frags[k] = frags[k + 1];
+            frag_lens[k] = frag_lens[k + 1];
+        }
+        count--;
+
+        frags[count] = merged;
+        frag_lens[count] = new_len;
+        count++;
+
+        if (count % 10 == 0 || count == 1)
+            fprintf(stderr, "\r[Assembly] fragments: %d  best_overlap: %d   ",
+                count, best_score);
+    }
+    fprintf(stderr, "\n");
+
+    /* 결과를 N 길이로 자름 */
+    if (frag_lens[0] > N)
+        frags[0][N] = '\0';
+
+    return frags[0];
+}
+
+/* ══════════════════════════════════════════════════════════════ */
+int main(void) {
+    /* ── 1. Reference genome 생성 ── */
+    char ref[N + 1];
+    for (int i = 0; i < N; i++)
+        ref[i] = BASE[rng_next() % 4];
+    ref[N] = '\0';
+
+    /* ── 2. Sample genome (SNP 도입) ── */
+    char sample[N + 1];
+    memcpy(sample, ref, N + 1);
+
+    int used[N];
+    memset(used, 0, sizeof(used));
+    int snp_count = 0;
+
+    while (snp_count < NUM_SNPS) {
+        int p = rng_next() % N;
+        if (used[p]) continue;
+        used[p] = 1;
+        char orig = sample[p];
+        char mut;
+        do { mut = BASE[rng_next() % 4]; } while (mut == orig);
+        sample[p] = mut;
+        snp_count++;
+    }
+
+    /* ── 3. Reads 생성 ── */
+    char reads[M][L + 1];
+    for (int i = 0; i < M; i++) {
+        int st = rng_next() % (N - L + 1);
+        memcpy(reads[i], sample + st, L);
+        reads[i][L] = '\0';
+
+        for (int j = 0; j < L; j++) {
+            if (rng_double() < SEQ_ERROR_RATE) {
+                char orig = reads[i][j];
+                char err;
+                do { err = BASE[rng_next() % 4]; } while (err == orig);
+                reads[i][j] = err;
+            }
+        }
+    }
+
+    /* ── 4. 파일 출력 ── */
+#ifdef _WIN32
+    _mkdir("data");
+#else
+    system("mkdir -p data");
+#endif
+
+    FILE* fp;
+
+    fp = fopen("data/reference.txt", "w");
+    fprintf(fp, "%s\n", ref);
+    fclose(fp);
+
+    fp = fopen("data/reads.txt", "w");
+    fprintf(fp, "%d\n", M);
+    for (int i = 0; i < M; i++)
+        fprintf(fp, "%s\n", reads[i]);
+    fclose(fp);
+
+    fp = fopen("data/answer.txt", "w");
+    fprintf(fp, "%s\n", sample);
+    fclose(fp);
+
+    /* ── 5. 통계 출력 ── */
+    int snps = 0;
+    for (int i = 0; i < N; i++)
+        if (ref[i] != sample[i]) snps++;
+
+    printf("=== Data Generation Complete ===\n");
+    printf("Reference:  %d bp\n", N);
+    printf("SNPs:       %d\n", snps);
+    printf("Reads:      %d x %d bp\n", M, L);
+    printf("Coverage:   %.1fx\n", (double)M * L / N);
+    printf("Error rate: %.2f%%\n", SEQ_ERROR_RATE * 100);
+    printf("Output:     data/{reference,reads,answer}.txt\n\n");
+
+    /* ── 6. Greedy Assembly ── */
+    printf("=== Greedy Assembly Start ===\n");
+    clock_t t0 = clock();
+
+    /* reads를 힙에 복사 (assembly 중 free/realloc 하므로) */
+    char** frags = (char**)malloc(M * sizeof(char*));
+    int* frag_lens = (int*)malloc(M * sizeof(int));
+    for (int i = 0; i < M; i++) {
+        frags[i] = (char*)malloc(L + 1);
+        memcpy(frags[i], reads[i], L + 1);
+        frag_lens[i] = L;
+    }
+
+    char* assembled = greedy_assembly(frags, frag_lens, M);
+
+    clock_t t1 = clock();
+    double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
+
+    fp = fopen("data/assembly.txt", "w");
+    fprintf(fp, "%s\n", assembled);
+    fclose(fp);
+
+    /* ── 7. 평가: answer(sample)와 비교 ── */
+    int asm_len = (int)strlen(assembled);
+    int cmp_len = asm_len < N ? asm_len : N;
+    int match = 0;
+    for (int i = 0; i < cmp_len; i++)
+        if (assembled[i] == sample[i]) match++;
+
+    printf("=== Assembly Result ===\n");
+    printf("Assembly length : %d bp\n", cmp_len);
+    printf("Accuracy        : %d / %d (%.2f%%)\n",
+        match, cmp_len, 100.0 * match / cmp_len);
+    printf("Time            : %.2f s\n", elapsed);
+    printf("Output          : data/assembly.txt\n");
+
+    /* cleanup */
+    free(assembled);
+    free(frags);
+    free(frag_lens);
+
+    return 0;
+}
